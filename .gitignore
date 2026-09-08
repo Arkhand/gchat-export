@@ -1,0 +1,13 @@
+# secretos — nunca commitear
+credentials.json
+token.json
+client_secret_*.json
+
+# nombres y mails del directorio de la empresa
+personas.json
+
+# salida: conversaciones de trabajo en texto plano
+out/
+
+__pycache__/
+.playwright-mcp/
