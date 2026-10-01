@@ -1,13 +1,16 @@
-# secretos — nunca commitear
+# secrets: never commit
 credentials.json
 token.json
 client_secret_*.json
 
-# nombres y mails del directorio de la empresa
-personas.json
-
-# salida: conversaciones de trabajo en texto plano
+# data: work conversations, names and emails. Lives in ~/gchat-export by
+# default; these cover a data dir pointed inside the repo, and the old layout.
+*.db
+*.db-wal
+*.db-shm
+md/
 out/
+personas.json
 
 __pycache__/
 .playwright-mcp/

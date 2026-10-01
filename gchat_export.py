@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
-"""Baja los mensajes de Google Chat a texto plano, particionados por mes y space.
+"""Download Google Chat messages into a local SQLite store, plus readable Markdown.
 
-Solo baja. No resume: eso se hace despues leyendo la salida.
+It only downloads. It does not summarize or interpret anything: another program
+(an MCP server, a skill, a scheduled job) calls it and then reads what it left.
 
-Pensado para correr standalone y ser invocado por otra cosa (MCP, skill, cron):
-no pide nada por consola salvo la primera autorizacion, y con --json escupe un
-resumen parseable de que archivos escribio.
+Typical use:
+    python -u gchat_export.py --list-spaces            # what is visible, and as whom
+    python -u gchat_export.py                          # catch up since the last run
+    python -u gchat_export.py --month 2026-08          # backfill a whole month
+    python -u gchat_export.py --non-interactive --json # from another program
 
-Uso tipico:
-    python -u gchat_export.py --list-spaces      # ver que hay (y con que cuenta)
-    python -u gchat_export.py                    # mes actual
-    python -u gchat_export.py --month 2026-08
-    python -u gchat_export.py --days 30
+Output, under the data dir (--data-dir, $GCHAT_DATA_DIR, or ~/gchat-export):
+    gchat.db                            SQLite store, the source of truth
+    md/2026-08/La-interna-b451c5.md     one readable file per space and month
 
-Salida:
-    out/2026-08/Proyecto-X-a1b2c3.md
-    out/2026-08/Marce-Gomez-d4e5f6.md
+A consumer picks up new and changed messages with:
+    SELECT * FROM v_messages WHERE seq > :last_seen ORDER BY seq
 
-Cada archivo declara en su cabecera que rango cubre, asi una segunda corrida
-solo baja lo que falta. Ver --force para ignorar eso.
+Exit codes: 0 ok, 1 error, 2 partial (some spaces not accessible),
+            3 authorization required (only with --non-interactive).
 
-Exit codes: 0 ok · 1 error duro · 2 parcial (algun space sin acceso).
-
-Necesita credentials.json (OAuth client tipo Desktop) en el mismo directorio.
-El token queda en token.json; la cuenta sale de ahi, no de un parametro.
+Needs credentials.json (OAuth client, Desktop type) next to this script. The
+token is kept in token.json; the account comes from it, not from a parameter.
 """
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import unicodedata
 from collections import defaultdict
@@ -44,9 +44,9 @@ from googleapiclient.errors import HttpError
 SCOPES = [
     "https://www.googleapis.com/auth/chat.spaces.readonly",
     "https://www.googleapis.com/auth/chat.messages.readonly",
-    # La Chat API no devuelve nombres de personas en ningun endpoint: ni en
-    # sender.displayName ni en las membresias, solo users/NNN. Los nombres
-    # salen del directorio de Workspace via People API.
+    # The Chat API never returns people's names, neither in sender.displayName
+    # nor in memberships: only users/NNN ids. Names come from the Workspace
+    # directory through the People API.
     "https://www.googleapis.com/auth/chat.memberships.readonly",
     "https://www.googleapis.com/auth/directory.readonly",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -55,256 +55,469 @@ SCOPES = [
 HERE = os.path.dirname(os.path.abspath(__file__))
 CREDS = os.path.join(HERE, "credentials.json")
 TOKEN = os.path.join(HERE, "token.json")
-# Cache de users/NNN -> nombre. Evita cientos de llamadas por corrida.
-PEOPLE_CACHE = os.path.join(HERE, "personas.json")
+DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), "gchat-export")
+DB_NAME = "gchat.db"
+SCHEMA_VERSION = 1
+RETRIES = 3  # googleapiclient retries 429 and 5xx with exponential backoff
 
-# Marca en la cabecera de cada .md con el rango realmente cubierto.
-HEADER_RE = re.compile(
-    r"<!-- gchat-export space=(?P<space>\S+) cubre=(?P<since>\S+)/(?P<until>\S+) "
-    r"bajado=(?P<at>\S+) -->"
-)
+EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_AUTH = 0, 1, 2, 3
 
 
 # ---------------------------------------------------------------- auth
 
-def get_creds(reauth=False, quiet=False):
+class AuthRequired(Exception):
+    """Raised instead of opening a browser when running non-interactively."""
+
+
+def get_creds(reauth=False, interactive=True, log=print):
     if reauth and os.path.exists(TOKEN):
         os.remove(TOKEN)
-        if not quiet:
-            print("[i] token.json borrado; hay que volver a autorizar.")
+        log("[i] token.json removed; authorization required.")
 
     creds = None
     if os.path.exists(TOKEN):
         creds = Credentials.from_authorized_user_file(TOKEN, SCOPES)
+    if creds and creds.valid:
+        return creds
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            log(f"[!] Token refresh failed ({e}).")
+            creds = None
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception as e:
-                print(f"[!] No se pudo refrescar el token ({e}); re-autenticando.", file=sys.stderr)
-                creds = None
-        if not creds or not creds.valid:
-            if not os.path.exists(CREDS):
-                sys.exit(f"[X] Falta {CREDS}. Ver SETUP.md, paso 4.")
-            print(
-                "[i] Abri la URL de abajo con la cuenta de Workspace (no el Gmail personal).",
-                file=sys.stderr,
-            )
-            flow = InstalledAppFlow.from_client_secrets_file(CREDS, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+        # A caller running unattended must never hang waiting for a browser.
+        if not interactive:
+            raise AuthRequired("authorization required: run once without --non-interactive")
+        if not os.path.exists(CREDS):
+            raise SystemExit(f"[X] Missing {CREDS}. See SETUP.md, step 4.")
+        log("[i] Open the URL below with the Workspace account (not a personal Gmail).")
+        flow = InstalledAppFlow.from_client_secrets_file(CREDS, SCOPES)
+        creds = flow.run_local_server(port=0)
+    with open(TOKEN, "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
     return creds
 
 
 def whoami(creds):
-    """Email de la cuenta autorizada, para no bajar con la cuenta equivocada."""
+    """Email of the authorized account, so the wrong account is noticed early."""
     try:
         svc = build("oauth2", "v2", credentials=creds, cache_discovery=False)
-        return svc.userinfo().get().execute().get("email") or "?"
+        return svc.userinfo().get().execute(num_retries=RETRIES).get("email") or "?"
     except Exception:
         return "?"
 
 
-# ---------------------------------------------------------------- API
+# ---------------------------------------------------------------- Chat API
 
-def list_spaces(svc):
-    spaces, token = [], None
+def _pages(make_request):
+    token = None
     while True:
-        resp = svc.spaces().list(pageSize=1000, pageToken=token).execute()
-        spaces.extend(resp.get("spaces", []))
+        resp = make_request(token).execute(num_retries=RETRIES)
+        yield resp
         token = resp.get("nextPageToken")
         if not token:
-            break
+            return
+
+
+def list_spaces(svc):
+    spaces = []
+    for resp in _pages(lambda t: svc.spaces().list(pageSize=1000, pageToken=t)):
+        spaces.extend(resp.get("spaces", []))
     return spaces
 
 
-def list_messages(svc, space_name, since_iso, until_iso):
-    flt = f'createTime > "{since_iso}" AND createTime < "{until_iso}"'
-    msgs, token = [], None
-    while True:
-        resp = (
-            svc.spaces()
-            .messages()
-            .list(parent=space_name, filter=flt, pageSize=1000, pageToken=token)
-            .execute()
-        )
+def list_members(svc, space_name):
+    """Human member ids of a space. Chat never returns their names."""
+    ids = set()
+    for resp in _pages(lambda t: svc.spaces().members().list(
+            parent=space_name, pageSize=1000, pageToken=t)):
+        for ms in resp.get("memberships", []):
+            user = ms.get("member") or {}
+            if user.get("name") and user.get("type") == "HUMAN":
+                ids.add(user["name"])
+    return sorted(ids)
+
+
+def list_messages(svc, space_name, since, until):
+    """Messages created in [since, until), both dates in UTC."""
+    # The filter only supports strict < and >, so start a hair before midnight.
+    start = dt.datetime.combine(since, dt.time()) - dt.timedelta(microseconds=1)
+    flt = (f'createTime > "{start:%Y-%m-%dT%H:%M:%S.%f}Z" '
+           f'AND createTime < "{until.isoformat()}T00:00:00Z"')
+    msgs = []
+    for resp in _pages(lambda t: svc.spaces().messages().list(
+            parent=space_name, filter=flt, pageSize=1000, pageToken=t)):
         msgs.extend(resp.get("messages", []))
-        token = resp.get("nextPageToken")
-        if not token:
-            break
     return msgs
 
 
-# ---------------------------------------------------------------- personas
-
-def cache_name(entry):
-    """El cache guarda {nombre,email}; las versiones viejas guardaban un str."""
-    if isinstance(entry, dict):
-        return entry.get("nombre") or ""
-    return entry or ""
-
-
-def cache_email(entry):
-    return entry.get("email", "") if isinstance(entry, dict) else ""
-
-
-def load_people_cache():
+def people_lookup(creds, log=print):
+    """Returns lookup(user_ids) -> {user_id: (name, email)} backed by People API."""
     try:
-        with open(PEOPLE_CACHE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_people_cache(cache):
-    try:
-        tmp = PEOPLE_CACHE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp, PEOPLE_CACHE)
+        svc = build("people", "v1", credentials=creds, cache_discovery=False)
     except Exception as e:
-        print(f"[!] No se pudo guardar {PEOPLE_CACHE}: {e}", file=sys.stderr)
+        log(f"[!] People API unavailable ({e}); people will show as users/NNN.")
+        return lambda ids: {}
 
-
-def resolve_names(creds, user_ids, cache, log=print):
-    """users/NNN -> nombre via People API, cacheando en disco.
-
-    La Chat API no devuelve nombres (ni en sender ni en membresias), asi que
-    los buscamos en el directorio de Workspace. El cache evita repetir cientos
-    de llamadas en cada corrida.
-    """
-    faltan = sorted(u for u in user_ids if u and u not in cache)
-    if not faltan:
-        return cache
-    try:
-        people = build("people", "v1", credentials=creds, cache_discovery=False)
-    except Exception as e:
-        log(f"[!] No se pudo usar People API: {e}")
-        return cache
-
-    log(f"[i] Resolviendo {len(faltan)} nombres nuevos...")
-    fallados = 0
-    # getBatchGet acepta hasta 50 por llamada.
-    for i in range(0, len(faltan), 50):
-        lote = faltan[i:i + 50]
-        try:
-            resp = people.people().getBatchGet(
-                resourceNames=[u.replace("users/", "people/") for u in lote],
-                personFields="names,emailAddresses",
-            ).execute()
-        except HttpError as e:
-            fallados += len(lote)
-            if i == 0:  # con que avise una vez alcanza
-                log(f"[!] People API fallo: HTTP {e.resp.status}")
-            continue
-        for r in resp.get("responses", []):
-            per = r.get("person") or {}
-            rn = per.get("resourceName") or r.get("requestedResourceName") or ""
-            uid = rn.replace("people/", "users/")
-            nombre = ""
-            for n in per.get("names") or []:
-                nombre = (n.get("displayName") or "").strip()
-                if nombre:
-                    break
-            if not nombre:
-                for em in per.get("emailAddresses") or []:
-                    nombre = (em.get("value") or "").split("@")[0]
-                    if nombre:
-                        break
-            email = ""
-            for em in per.get("emailAddresses") or []:
-                email = (em.get("value") or "").strip()
-                if email:
-                    break
-            if uid and nombre:
-                cache[uid] = {"nombre": nombre, "email": email} if email else nombre
-    if fallados:
-        log(f"[!] {fallados} nombres no se pudieron resolver; quedan como users/NNN.")
-    save_people_cache(cache)
-    return cache
-
-
-def list_members(svc, space_name):
-    """{users/NNN: nombre} de un space. El nombre viene vacio casi siempre:
-    la Chat API no lo manda, se completa despues con resolve_names()."""
-    people, token = {}, None
-    while True:
-        try:
-            resp = (
-                svc.spaces()
-                .members()
-                .list(parent=space_name, pageSize=1000, pageToken=token)
-                .execute()
-            )
-        except HttpError:
-            return people
-        for ms in resp.get("memberships", []):
-            u = ms.get("member") or {}
-            uid = u.get("name")
-            if not uid or u.get("type") != "HUMAN":
+    def lookup(user_ids):
+        found = {}
+        for i in range(0, len(user_ids), 50):  # getBatchGet takes up to 50
+            batch = user_ids[i:i + 50]
+            try:
+                resp = svc.people().getBatchGet(
+                    resourceNames=[u.replace("users/", "people/") for u in batch],
+                    personFields="names,emailAddresses",
+                ).execute(num_retries=RETRIES)
+            except HttpError as e:
+                log(f"[!] People API failed: HTTP {e.resp.status}")
                 continue
-            people[uid] = (u.get("displayName") or "").strip()
-        token = resp.get("nextPageToken")
-        if not token:
-            return people
+            for r in resp.get("responses", []):
+                person = r.get("person") or {}
+                rn = person.get("resourceName") or r.get("requestedResourceName") or ""
+                email = next((e.get("value", "").strip()
+                              for e in person.get("emailAddresses") or [] if e.get("value")), "")
+                name = next((n.get("displayName", "").strip()
+                             for n in person.get("names") or [] if n.get("displayName")), "")
+                name = name or email.split("@")[0]
+                if rn and name:
+                    found[rn.replace("people/", "users/")] = (name, email)
+        return found
+
+    return lookup
 
 
-def my_user_id(my_email, cache, members_by_space, log=print):
-    """Cual de los users/NNN soy yo. Sin esto los DMs se nombran con mi propio
-    nombre en vez del de la otra persona.
+# ---------------------------------------------------------------- dates
 
-    Por email es exacto (people/me necesitaria el scope 'profile', que no
-    pedimos). Si el directorio no devolvio mi email, cae a la interseccion:
-    yo soy el unico miembro que aparece en todos los spaces.
+def utc_today():
+    return dt.datetime.now(dt.timezone.utc).date()
+
+
+def month_start(d):
+    return d.replace(day=1)
+
+
+def next_month(d):
+    return (d.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+
+
+def merge_intervals(intervals):
+    """Sorted, non-overlapping [since, until) date intervals; touching ones join."""
+    merged = []
+    for a, b in sorted(i for i in intervals if i[0] < i[1]):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def gaps(window, covered):
+    """Parts of window [since, until) not inside any covered interval."""
+    a, b = window
+    out = []
+    for c0, c1 in merge_intervals(covered):
+        if c1 <= a or c0 >= b:
+            continue
+        if c0 > a:
+            out.append((a, c0))
+        a = max(a, c1)
+        if a >= b:
+            break
+    if a < b:
+        out.append((a, b))
+    return out
+
+
+# ---------------------------------------------------------------- store
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE IF NOT EXISTS spaces (
+    name TEXT PRIMARY KEY,
+    title TEXT,
+    type TEXT,
+    uri TEXT,
+    last_active_time TEXT,
+    membership_count TEXT,   -- JSON; a change triggers a members refresh
+    members TEXT,            -- JSON list of users/NNN
+    raw TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS people (
+    user_id TEXT PRIMARY KEY,
+    name TEXT,
+    email TEXT,
+    resolved_at TEXT
+);
+
+-- Days fully downloaded per space, as [since, until) date intervals.
+CREATE TABLE IF NOT EXISTS coverage (
+    space TEXT NOT NULL,
+    since TEXT NOT NULL,
+    until TEXT NOT NULL,
+    PRIMARY KEY (space, since)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    name TEXT PRIMARY KEY,   -- spaces/X/messages/Y, stable across edits
+    space TEXT NOT NULL,
+    thread TEXT,
+    sender_id TEXT,
+    create_time TEXT NOT NULL,
+    update_time TEXT,
+    text TEXT,
+    attachments TEXT,        -- JSON list of file names
+    quote_type TEXT,         -- FORWARD or REPLY when quoting another message
+    quoted_sender TEXT,
+    quoted_text TEXT,        -- a forward's real content is here, not in text
+    raw TEXT NOT NULL,       -- the API message, minus expiring URLs
+    deleted INTEGER NOT NULL DEFAULT 0,
+    seq INTEGER NOT NULL,    -- grows on every insert, edit or deletion
+    fetched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_seq ON messages (seq);
+CREATE INDEX IF NOT EXISTS messages_space_time ON messages (space, create_time);
+CREATE INDEX IF NOT EXISTS messages_thread ON messages (thread);
+
+CREATE VIEW IF NOT EXISTS v_messages AS
+SELECT m.seq, m.name, m.space, s.title AS space_title, s.type AS space_type,
+       m.thread, m.sender_id, COALESCE(p.name, m.sender_id) AS sender_name,
+       p.email AS sender_email, m.create_time, m.update_time, m.text,
+       m.attachments, m.quote_type, m.quoted_sender, m.quoted_text, m.deleted
+FROM messages m
+LEFT JOIN spaces s ON s.name = m.space
+LEFT JOIN people p ON p.user_id = m.sender_id;
+"""
+
+UPSERT_MESSAGE = """
+INSERT INTO messages (name, space, thread, sender_id, create_time, update_time,
+                      text, attachments, quote_type, quoted_sender, quoted_text,
+                      raw, deleted, seq, fetched_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+ON CONFLICT (name) DO UPDATE SET
+    space = excluded.space, thread = excluded.thread,
+    sender_id = excluded.sender_id, create_time = excluded.create_time,
+    update_time = excluded.update_time, text = excluded.text,
+    attachments = excluded.attachments, quote_type = excluded.quote_type,
+    quoted_sender = excluded.quoted_sender, quoted_text = excluded.quoted_text,
+    raw = excluded.raw, deleted = 0,
+    seq = excluded.seq, fetched_at = excluded.fetched_at
+"""
+
+UPSERT_SPACE = """
+INSERT INTO spaces (name, title, type, uri, last_active_time, membership_count,
+                    members, raw, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (name) DO UPDATE SET
+    title = excluded.title, type = excluded.type, uri = excluded.uri,
+    last_active_time = excluded.last_active_time,
+    membership_count = excluded.membership_count, members = excluded.members,
+    raw = excluded.raw, updated_at = excluded.updated_at
+"""
+
+
+def open_db(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path, isolation_level=None, timeout=30)
+    conn.row_factory = sqlite3.Row
+    # WAL lets a consumer read while a download is writing.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(SCHEMA)
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    if row is None:
+        conn.execute("INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+    elif int(row["value"]) > SCHEMA_VERSION:
+        conn.close()
+        raise SystemExit(f"[X] {path} has schema v{row['value']}; "
+                         f"this script only knows v{SCHEMA_VERSION}.")
+    return conn
+
+
+@contextlib.contextmanager
+def write_tx(conn):
+    """IMMEDIATE takes the write lock up front, so seq stays unique even if two
+    downloads run at once."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def max_seq(conn):
+    return conn.execute("SELECT COALESCE(MAX(seq), 0) FROM messages").fetchone()[0]
+
+
+def get_coverage(conn, space):
+    return [(dt.date.fromisoformat(r["since"]), dt.date.fromisoformat(r["until"]))
+            for r in conn.execute("SELECT since, until FROM coverage WHERE space = ?", (space,))]
+
+
+def add_coverage(conn, space, since, until):
+    """Must run inside write_tx."""
+    if since >= until:
+        return
+    merged = merge_intervals(get_coverage(conn, space) + [(since, until)])
+    conn.execute("DELETE FROM coverage WHERE space = ?", (space,))
+    conn.executemany("INSERT INTO coverage VALUES (?, ?, ?)",
+                     [(space, a.isoformat(), b.isoformat()) for a, b in merged])
+
+
+VOLATILE_KEYS = {"downloadUri", "thumbnailUri"}
+
+
+def stable(value):
+    """The message without fields that change on every fetch, at any depth.
+
+    Attachment download and thumbnail URLs carry a fresh access token each time,
+    both on the message and inside a quoted or forwarded one. Kept, they would make
+    those messages look edited on every run, and a consumer would reprocess them
+    for nothing. They also expire; attachmentDataRef is the stable reference.
+    """
+    if isinstance(value, dict):
+        return {k: stable(v) for k, v in value.items() if k not in VOLATILE_KEYS}
+    if isinstance(value, list):
+        return [stable(v) for v in value]
+    return value
+
+
+def quote_of(m):
+    """(type, sender, text) of the message this one quotes or forwards.
+
+    A forward often has no text of its own: its whole content lives here.
+    """
+    q = m.get("quotedMessageMetadata") or {}
+    if not q:
+        return None, None, None
+    snap = q.get("quotedMessageSnapshot") or {}
+    sender = snap.get("sender")
+    if isinstance(sender, dict):
+        sender = sender.get("displayName") or sender.get("name")
+    text = (snap.get("text") or snap.get("formattedText") or "").strip()
+    files = " ".join(f"[attachment: {a.get('contentName') or 'file'}]"
+                     for a in snap.get("attachments") or [])
+    text = " ".join(t for t in (text, files) if t)
+    return q.get("quoteType"), sender or None, text or None
+
+
+def store_window(conn, space, msgs, since, until, covered_until, now_iso):
+    """Upsert one fetched window of a space and record it as covered.
+
+    Messages that come back identical keep their seq. Stored messages of this
+    window that the API no longer returns were deleted in Chat: they are flagged
+    rather than removed, with a new seq so a consumer notices.
+
+    Returns (changed, deleted, touched months, sender ids).
+    """
+    changed = deleted = 0
+    months, senders = set(), set()
+    with write_tx(conn):
+        seq = max_seq(conn)
+        # Compare by date prefix: as text, "00:00:00.1Z" sorts before "00:00:00Z".
+        stored = {r["name"]: r for r in conn.execute(
+            "SELECT name, raw, deleted, create_time FROM messages "
+            "WHERE space = ? AND substr(create_time, 1, 10) >= ? "
+            "AND substr(create_time, 1, 10) < ?",
+            (space, since.isoformat(), until.isoformat()))}
+        seen = set()
+        for m in map(stable, msgs):
+            name = m.get("name")
+            if not name:
+                continue
+            seen.add(name)
+            sender = (m.get("sender") or {}).get("name")
+            if sender:
+                senders.add(sender)
+            raw = json.dumps(m, ensure_ascii=False, sort_keys=True)
+            old = stored.get(name)
+            if old is not None and old["raw"] == raw and not old["deleted"]:
+                continue
+            seq += 1
+            attachments = [a.get("contentName") or "attachment" for a in m.get("attachment") or []]
+            conn.execute(UPSERT_MESSAGE, (
+                name, space, (m.get("thread") or {}).get("name"), sender,
+                m.get("createTime") or "", m.get("lastUpdateTime"),
+                m.get("text") or m.get("formattedText") or "",
+                json.dumps(attachments, ensure_ascii=False), *quote_of(m), raw, seq, now_iso))
+            changed += 1
+            months.add((m.get("createTime") or "")[:7])
+        for name, old in stored.items():
+            if name not in seen and not old["deleted"]:
+                seq += 1
+                conn.execute("UPDATE messages SET deleted = 1, seq = ?, fetched_at = ? "
+                             "WHERE name = ?", (seq, now_iso, name))
+                deleted += 1
+                months.add(old["create_time"][:7])
+        add_coverage(conn, space, since, covered_until)
+    return changed, deleted, months, senders
+
+
+# ---------------------------------------------------------------- people
+
+def resolve_people(conn, lookup, user_ids, now_iso, log=print):
+    """Look up the ids not seen before. Unresolved ones are retried next run."""
+    known = {r[0] for r in conn.execute("SELECT user_id FROM people")}
+    missing = sorted(u for u in user_ids if u and u not in known)
+    if not missing:
+        return
+    log(f"[i] Resolving {len(missing)} new people...")
+    found = lookup(missing)
+    with write_tx(conn):
+        conn.executemany("INSERT OR REPLACE INTO people VALUES (?, ?, ?, ?)",
+                         [(u, name, email, now_iso) for u, (name, email) in found.items()])
+    if len(found) < len(missing):
+        log(f"[!] {len(missing) - len(found)} people could not be resolved; "
+            f"they show as users/NNN.")
+
+
+def people_names(conn):
+    return {r["user_id"]: r["name"] for r in conn.execute("SELECT user_id, name FROM people")}
+
+
+def my_user_id(conn, my_email, members_by_space):
+    """Which users/NNN is the account running this. Without it, every DM would
+    be named after its owner instead of the other person.
+
+    By email it is exact (people/me needs the 'profile' scope, which we do not
+    ask for). Fallback: the only member present in every space.
     """
     if my_email:
-        for uid, entry in cache.items():
-            if cache_email(entry).lower() == my_email.lower():
-                return uid
-
-    conjuntos = [set(p) for p in members_by_space.values() if p]
-    if not conjuntos:
+        row = conn.execute("SELECT user_id FROM people WHERE lower(email) = lower(?)",
+                           (my_email,)).fetchone()
+        if row:
+            return row[0]
+    sets = [set(ids) for ids in members_by_space.values() if ids]
+    if not sets:
         return None
-    comun = set.intersection(*conjuntos)
-    return next(iter(comun)) if len(comun) == 1 else None
+    common = set.intersection(*sets)
+    return next(iter(common)) if len(common) == 1 else None
 
 
-def dm_counterpart(people, me_id, my_name=None):
-    """En un DM, el nombre del otro. None si no se puede determinar."""
-    otros = [n for uid, n in people.items() if uid != me_id and n]
-    if len(otros) == 1:
-        return otros[0]
-    # Si no supimos cual era mi id, al menos descartar por nombre: un DM que
-    # se llama como uno mismo no le sirve a nadie.
-    if my_name:
-        otros = [n for n in otros if n != my_name]
-        if len(otros) == 1:
-            return otros[0]
-    return None
+# ---------------------------------------------------------------- names
+
+def space_type(sp):
+    return sp.get("spaceType") or sp.get("type") or "?"
 
 
-# ---------------------------------------------------------------- nombres
-
-def space_title(sp, people=None, me_id=None, my_name=None):
-    name = (sp.get("displayName") or "").strip()
-    if name:
-        return name
-    kind = sp.get("spaceType") or sp.get("type") or ""
-    # Los DMs no traen displayName: los nombramos por la otra persona.
-    if kind == "DIRECT_MESSAGE" and people:
-        otro = dm_counterpart(people, me_id, my_name)
-        if otro:
-            return otro
-    if kind == "GROUP_CHAT" and people:
-        otros = sorted(n for uid, n in people.items()
-                        if uid != me_id and n and n != my_name)
-        if otros:
-            corte = ", ".join(otros[:3])
-            return corte + (f" +{len(otros) - 3}" if len(otros) > 3 else "")
-    return {"DIRECT_MESSAGE": "DM sin nombre", "GROUP_CHAT": "Grupo sin nombre"}.get(
-        kind, "Sin nombre"
-    )
+def space_title(sp, member_ids, names, me_id):
+    title = (sp.get("displayName") or "").strip()
+    if title:
+        return title
+    kind = space_type(sp)
+    my_name = names.get(me_id)
+    # DMs and unnamed groups have no displayName: name them after the others.
+    others = sorted(names[u] for u in member_ids
+                    if u != me_id and names.get(u) and names[u] != my_name)
+    if kind == "DIRECT_MESSAGE" and len(others) == 1:
+        return others[0]
+    if kind == "GROUP_CHAT" and others:
+        return ", ".join(others[:3]) + (f" +{len(others) - 3}" if len(others) > 3 else "")
+    return {"DIRECT_MESSAGE": "Unnamed DM", "GROUP_CHAT": "Unnamed group"}.get(kind, "Unnamed space")
 
 
 def slugify(text):
@@ -316,153 +529,79 @@ def slugify(text):
     return text[:60] or "space"
 
 
-def space_filename(sp, people=None, me_id=None, my_name=None):
-    """Nombre legible + sufijo del ID: dos spaces distintos nunca se pisan.
-
-    El sufijo sale del ID del space, asi que el archivo es estable aunque la
-    persona se cambie el nombre o se renombre el space.
-    """
-    sid = sp.get("name", "")
-    suffix = hashlib.sha1(sid.encode("utf-8")).hexdigest()[:6]
-    return f"{slugify(space_title(sp, people, me_id, my_name))}-{suffix}.md"
+def space_filename(space_name, title):
+    """Readable name plus a suffix from the space id: two spaces never collide,
+    and the suffix survives renames."""
+    suffix = hashlib.sha1(space_name.encode("utf-8")).hexdigest()[:6]
+    return f"{slugify(title)}-{suffix}.md"
 
 
-# ---------------------------------------------------------------- fechas
+# ---------------------------------------------------------------- markdown
 
-def months_between(since, until):
-    """Meses (date del dia 1) tocados por [since, until). until es exclusivo."""
-    out, cur = [], since.replace(day=1)
-    last = (until - dt.timedelta(days=1)).replace(day=1)
-    while cur <= last:
-        out.append(cur)
-        cur = (cur.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
-    return out
-
-
-def month_bounds(m):
-    nxt = (m.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
-    return m, nxt
-
-
-def iso_z(d):
-    return f"{d.isoformat()}T00:00:00Z"
-
-
-# ---------------------------------------------------------------- estado
-
-def read_header(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for _ in range(5):
-                line = f.readline()
-                if not line:
-                    break
-                m = HEADER_RE.search(line)
-                if m:
-                    return {
-                        "since": dt.date.fromisoformat(m.group("since")),
-                        "until": dt.date.fromisoformat(m.group("until")),
-                    }
-    except Exception:
-        pass
-    return None
-
-
-def already_covered(path, since, until):
-    """True si el archivo ya cubre [since, until) entero."""
-    h = read_header(path)
-    return bool(h) and h["since"] <= since and h["until"] >= until
-
-
-# ---------------------------------------------------------------- render
-
-def sender_of(m, people=None):
+def sender_name(m, names):
     s = m.get("sender") or {}
-    uid = s.get("name")
-    nom = (s.get("displayName") or "").strip()
-    if nom:
-        return nom
-    # Con auth de usuario displayName casi siempre viene vacio: lo sacamos
-    # de la membresia del space.
-    if people and uid and uid in people:
-        return people[uid]
-    return uid or "?"
+    return (s.get("displayName") or "").strip() or names.get(s.get("name")) or s.get("name") or "?"
 
 
 def body_of(m):
     text = (m.get("text") or m.get("formattedText") or "").strip()
     bits = [text] if text else []
     for att in m.get("attachment") or []:
-        fname = att.get("contentName") or "adjunto"
-        bits.append(f"[adjunto: {fname}]")
+        bits.append(f"[attachment: {att.get('contentName') or 'file'}]")
+    qtype, qsender, qtext = quote_of(m)
+    if qtext:
+        who = f" from {qsender}" if qsender else ""
+        if qtype == "FORWARD":
+            bits.append(f"[forwarded{who}: {qtext}]")
+        else:  # a reply quoting context: enough to know what it answers
+            bits.append(f"[quoting{who}: {qtext if len(qtext) <= 120 else qtext[:117] + '...'}]")
     if not bits and m.get("cardsV2"):
-        bits.append("(card / mensaje de app)")
-    return " ".join(bits) or "(sin texto)"
+        bits.append("(card / app message)")
+    return " ".join(bits) or "(no text)"
 
 
 def indent(text, pad):
     return text.replace("\n", "\n" + pad)
 
 
-def render(sp, msgs, since, until, now_iso, people=None, me_id=None, my_name=None):
-    """Markdown de un space para un mes. Agrupa por dia y por hilo."""
-    title = space_title(sp, people, me_id, my_name)
-    kind = sp.get("spaceType") or sp.get("type") or "?"
-
-    # Primera aparicion de cada hilo dentro de lo que bajamos. Si un hilo
-    # arranca mas tarde en el archivo pero se retoma antes, igual queremos
-    # saber cual fue su primer mensaje visible.
-    first_seen = {}
-    for m in sorted(msgs, key=lambda m: m.get("createTime") or ""):
-        tid = (m.get("thread") or {}).get("name")
-        if tid and tid not in first_seen:
-            first_seen[tid] = m.get("name")
-
+def render_markdown(space_name, title, kind, month, msgs, names, thread_start, now_iso):
+    """One space, one month. Grouped by day, then by thread."""
     lines = [
-        f"<!-- gchat-export space={sp['name']} cubre={since.isoformat()}/{until.isoformat()} "
-        f"bajado={now_iso} -->",
+        f"<!-- gchat-export space={space_name} month={month} messages={len(msgs)} "
+        f"generated={now_iso} -->",
         f"# {title}",
         "",
-        f"{kind} - {len(msgs)} mensajes - {since.isoformat()} a {until.isoformat()}",
+        f"{kind} - {len(msgs)} messages - {month} - times in UTC",
         "",
     ]
-
     by_day = defaultdict(list)
     for m in msgs:
-        by_day[(m.get("createTime") or "")[:10]].append(m)
+        by_day[m["createTime"][:10]].append(m)
 
     for day in sorted(by_day):
         lines += [f"## {day}", ""]
-        day_msgs = sorted(by_day[day], key=lambda m: m.get("createTime") or "")
-
-        # Agrupar por hilo, respetando el orden de aparicion dentro del dia.
         threads, order = defaultdict(list), []
-        for m in day_msgs:
+        for m in by_day[day]:
             tid = (m.get("thread") or {}).get("name") or m.get("name")
             if tid not in threads:
                 order.append(tid)
             threads[tid].append(m)
-
         for tid in order:
-            group = threads[tid]
-            head, rest = group[0], group[1:]
-            hhmm = (head.get("createTime") or "")[11:16]
-            # Si el hilo ya se habia visto otro dia, esto es continuacion; el
-            # arranque esta mas arriba en este archivo o en un mes anterior.
-            cont = " (sigue un hilo anterior)" if first_seen.get(tid) not in (None, head.get("name")) else ""
-            lines.append(f"**{hhmm} {sender_of(head, people)}**:{cont} {indent(body_of(head), '  ')}")
+            head, rest = threads[tid][0], threads[tid][1:]
+            # The thread started earlier: on a previous day, or a previous month.
+            started = thread_start.get(tid)
+            cont = " (continues an earlier thread)" if started and started < head["createTime"] else ""
+            lines.append(f"**{head['createTime'][11:16]} {sender_name(head, names)}**:{cont} "
+                         f"{indent(body_of(head), '  ')}")
             for m in rest:
-                hhmm = (m.get("createTime") or "")[11:16]
-                lines.append(f"  - **{hhmm} {sender_of(m, people)}**: {indent(body_of(m), '    ')}")
+                lines.append(f"  - **{m['createTime'][11:16]} {sender_name(m, names)}**: "
+                             f"{indent(body_of(m), '    ')}")
             lines.append("")
-
     return "\n".join(lines).rstrip() + "\n"
 
 
 def write_atomic(path, content):
-    """Temporal + rename: un Ctrl+C no deja un .md trunco haciendose pasar por completo."""
+    """Temp file + rename: an interrupted run never leaves a truncated file."""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
@@ -470,189 +609,323 @@ def write_atomic(path, content):
 
 
 def drop_renamed(mdir, path):
-    """Borra la version vieja de este space si cambio de nombre.
-
-    El sufijo del archivo sale del ID del space, asi que un mismo id con otro
-    nombre es el mismo space renombrado (p.ej. un DM que antes no tenia nombre).
-    Sin esto quedan dos .md con el mismo contenido.
-    """
+    """Remove an older file of the same space saved under a previous title."""
     base = os.path.basename(path)
     m = re.match(r"^.*-([0-9a-f]{6})\.md$", base)
     if not m or not os.path.isdir(mdir):
         return
-    suf = m.group(1)
     for f in os.listdir(mdir):
-        if f != base and f.endswith(f"-{suf}.md"):
-            try:
+        if f != base and f.endswith(f"-{m.group(1)}.md"):
+            with contextlib.suppress(OSError):
                 os.remove(os.path.join(mdir, f))
-            except OSError:
-                pass
 
 
-# ---------------------------------------------------------------- main
+def write_markdown(conn, md_dir, space_name, title, kind, month, names, now_iso):
+    """(Re)generate one space/month file from the store. Returns (path, count)."""
+    mdir = os.path.join(md_dir, month)
+    path = os.path.join(mdir, space_filename(space_name, title))
+    msgs = [json.loads(r[0]) for r in conn.execute(
+        "SELECT raw FROM messages WHERE space = ? AND deleted = 0 "
+        "AND substr(create_time, 1, 7) = ? ORDER BY create_time", (space_name, month))]
+    if not msgs:
+        drop_renamed(mdir, path)
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        return path, 0
+    thread_start = {r[0]: r[1] for r in conn.execute(
+        "SELECT thread, MIN(create_time) FROM messages WHERE space = ? AND deleted = 0 "
+        "AND thread IS NOT NULL GROUP BY thread", (space_name,))}
+    os.makedirs(mdir, exist_ok=True)
+    write_atomic(path, render_markdown(space_name, title, kind, month, msgs, names,
+                                       thread_start, now_iso))
+    drop_renamed(mdir, path)
+    return path, len(msgs)
 
-def main():
-    today = dt.date.today()
-    ap = argparse.ArgumentParser(
-        description="Baja mensajes de Google Chat a texto plano por mes y space."
-    )
-    ap.add_argument("--days", type=int, help="ultimos N dias")
-    ap.add_argument("--since", help="YYYY-MM-DD")
-    ap.add_argument("--until", help="YYYY-MM-DD (exclusivo)")
-    ap.add_argument("--month", help="YYYY-MM: un mes entero")
-    ap.add_argument("--only", action="append", default=[],
-                    help="solo spaces cuyo nombre contenga esto (repetible)")
-    ap.add_argument("--exclude", action="append", default=[],
-                    help="saltear spaces cuyo nombre contenga esto (repetible)")
-    ap.add_argument("--force", action="store_true", help="rebajar aunque ya este bajado")
-    ap.add_argument("--list-spaces", action="store_true", help="listar spaces y salir")
-    ap.add_argument("--reauth", action="store_true", help="borrar token y re-autorizar")
-    ap.add_argument("--json", action="store_true",
-                    help="resumen final en JSON por stdout (para invocar desde otro programa)")
-    ap.add_argument("--out", default=os.path.join(HERE, "out"))
-    args = ap.parse_args()
 
-    # Con --json, stdout queda limpio para el JSON: el resto va a stderr.
-    log = (lambda *a: print(*a, file=sys.stderr)) if args.json else print
+# ---------------------------------------------------------------- sync
 
-    if args.month:
-        try:
-            since = dt.date.fromisoformat(args.month + "-01")
-        except ValueError:
-            sys.exit(f"[X] --month invalido: {args.month} (formato YYYY-MM)")
-        until = month_bounds(since)[1]
-    elif args.days:
-        since, until = today - dt.timedelta(days=args.days), today + dt.timedelta(days=1)
-    else:
-        since = dt.date.fromisoformat(args.since) if args.since else today.replace(day=1)
-        until = dt.date.fromisoformat(args.until) if args.until else today + dt.timedelta(days=1)
+def load_spaces(conn, svc, lookup, account, now_iso, log=print):
+    """List spaces and refresh what is needed to name them.
 
-    if until <= since:
-        sys.exit(f"[X] Rango vacio: {since} -> {until}")
+    Members are fetched only for new spaces or when a space's membership count
+    changed; otherwise the stored list is reused. That keeps a daily run from
+    making ~100 calls to rediscover the same people.
 
-    creds = get_creds(reauth=args.reauth, quiet=args.json)
-    account = whoami(creds)
-    log(f"[i] Cuenta: {account}")
-    svc = build("chat", "v1", credentials=creds, cache_discovery=False)
-
+    Returns (spaces, titles, renamed space names, members refreshed).
+    """
     spaces = list_spaces(svc)
+    stored = {r["name"]: r for r in conn.execute(
+        "SELECT name, title, membership_count, members FROM spaces")}
+    members, counts, refreshed = {}, {}, 0
+    for sp in spaces:
+        name = sp["name"]
+        count = json.dumps(sp.get("membershipCount") or {}, sort_keys=True)
+        old = stored.get(name)
+        if old is not None and old["members"] is not None and old["membership_count"] == count:
+            members[name], counts[name] = json.loads(old["members"]), count
+            continue
+        try:
+            members[name], counts[name] = list_members(svc, name), count
+            refreshed += 1
+        except HttpError:
+            # Keep what we had; leave the count stale so it is retried next run.
+            members[name] = json.loads(old["members"]) if old is not None and old["members"] else []
+            counts[name] = old["membership_count"] if old is not None else None
 
-    # Miembros de cada space, una sola vez: de aca salen los nombres de las
-    # personas y el titulo de los DMs, que no traen displayName.
-    log(f"[i] Leyendo miembros de {len(spaces)} spaces...")
-    members = {sp["name"]: list_members(svc, sp["name"]) for sp in spaces}
-    me_id = None  # se resuelve despues de tener el cache de nombres
+    resolve_people(conn, lookup, {u for ids in members.values() for u in ids}, now_iso, log)
+    names = people_names(conn)
+    me_id = my_user_id(conn, account, members)
+    titles = {sp["name"]: space_title(sp, members[sp["name"]], names, me_id) for sp in spaces}
+    renamed = {n for n, t in titles.items()
+               if n in stored and stored[n]["title"] and stored[n]["title"] != t}
 
-    # Los nombres no vienen de Chat: se buscan en el directorio y se cachean.
-    todos = {uid for p in members.values() for uid in p}
-    cache = resolve_names(creds, todos, load_people_cache(), log)
-    nombres = {uid: cache_name(e) for uid, e in cache.items()}
-    me_id = my_user_id(account, cache, members, log)
-    for p in members.values():
-        for uid in p:
-            if nombres.get(uid):
-                p[uid] = nombres[uid]
+    with write_tx(conn):
+        conn.executemany(UPSERT_SPACE, [
+            (sp["name"], titles[sp["name"]], space_type(sp), sp.get("spaceUri"),
+             sp.get("lastActiveTime"), counts[sp["name"]],
+             json.dumps(members[sp["name"]]), json.dumps(sp, ensure_ascii=False, sort_keys=True),
+             now_iso)
+            for sp in spaces])
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('account', ?)", (account,))
+    return spaces, titles, renamed, refreshed
 
-    resueltos = sum(1 for uid in todos if nombres.get(uid))
-    log(f"[i] {resueltos}/{len(todos)} personas identificadas")
-    if todos and not resueltos:
-        log("[!] Ningun nombre resuelto: los mensajes van a salir como users/NNN.")
 
-    my_name = nombres.get(me_id) if me_id else None
+def sync(conn, svc, lookup, *, account, window, md_dir, force=False, only=(), exclude=(),
+         today=None, log=print):
+    """Bring the store up to date and regenerate the Markdown that changed.
 
-    def title_of(sp):
-        return space_title(sp, members.get(sp["name"]), me_id, my_name)
+    window=None is the incremental mode: each space resumes from the end of its
+    own coverage (or the start of the current month if it was never synced).
+    With a window, only the parts of it not yet covered are fetched, unless
+    force is set.
+    """
+    today = today or utc_today()
+    now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    seq_before = max_seq(conn)
 
-    def file_of(sp):
-        return space_filename(sp, members.get(sp["name"]), me_id, my_name)
+    spaces, titles, renamed, refreshed = load_spaces(conn, svc, lookup, account, now_iso, log=log)
 
-    def keep(sp):
-        title = title_of(sp).lower()
-        if args.only and not any(p.lower() in title for p in args.only):
+    def keep(title):
+        title = title.lower()
+        if only and not any(p.lower() in title for p in only):
             return False
-        return not any(p.lower() in title for p in args.exclude)
+        return not any(p.lower() in title for p in exclude)
 
-    kept = [sp for sp in spaces if keep(sp)]
+    kept = [sp for sp in spaces if keep(titles[sp["name"]])]
+    if window is None:
+        log(f"[i] {len(kept)} of {len(spaces)} spaces, incremental since each one's last sync")
+    else:
+        log(f"[i] {len(kept)} of {len(spaces)} spaces, window {window[0]} -> {window[1]}")
 
-    if args.list_spaces:
-        if args.json:
-            print(json.dumps({
-                "account": account,
-                "spaces": [
-                    {
-                        "name": sp["name"],
-                        "title": title_of(sp),
-                        "type": sp.get("spaceType") or sp.get("type"),
-                        "file": file_of(sp),
-                    }
-                    for sp in kept
-                ],
-            }, ensure_ascii=False, indent=2))
+    stats = {"total": len(spaces), "selected": len(kept), "fetched": 0,
+             "skipped_inactive": 0, "skipped_covered": 0, "members_refreshed": refreshed}
+    changed_total = deleted_total = 0
+    no_access, senders = [], set()
+    touched = defaultdict(set)
+
+    for sp in kept:
+        name, title = sp["name"], titles[sp["name"]]
+        covered = get_coverage(conn, name)
+        if window is None:
+            start = max((b for _, b in covered), default=month_start(today))
+            win = (min(start, today), today + dt.timedelta(days=1))
         else:
-            log(f"[i] {len(kept)} spaces accesibles (de {len(spaces)}):\n")
-            for sp in sorted(kept, key=lambda s: title_of(s).lower()):
-                kind = sp.get("spaceType") or sp.get("type") or "?"
-                log(f"    {title_of(sp):<45} {kind:<16} {file_of(sp)}")
-        return 0
+            win = window
+        todo = [win] if force else gaps(win, covered)
+        if not todo:
+            stats["skipped_covered"] += 1
+            continue
 
-    log(f"[i] Rango: {since} -> {until}  ({len(kept)} de {len(spaces)} spaces)")
-    now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-    this_month = today.replace(day=1)
-
-    files, total, skipped_done = [], 0, 0
-    no_access = []
-
-    for m in months_between(since, until):
-        m_start, m_end = month_bounds(m)
-        # El recorte importa: --days 7 no debe declarar el mes entero como cubierto.
-        lo, hi = max(m_start, since), min(m_end, until)
-        mdir = os.path.join(args.out, m.strftime("%Y-%m"))
-        log(f"\n[{m.strftime('%Y-%m')}]  {lo} -> {hi}")
-
-        for sp in kept:
-            people = members.get(sp["name"]) or {}
-            path = os.path.join(mdir, file_of(sp))
-            # El mes en curso siempre se rebaja: le siguen entrando mensajes.
-            if not args.force and m < this_month and already_covered(path, lo, hi):
-                skipped_done += 1
+        last_active = (sp.get("lastActiveTime") or "")[:10]
+        fetched = changed = deleted = 0
+        failed = False
+        for a, b in todo:
+            # Today is never final: leaving it uncovered makes the next run
+            # fetch it again whole, so a second run on the same day still sees
+            # the afternoon's messages.
+            done_until = min(b, today)
+            if not force and last_active and last_active < a.isoformat():
+                # Nothing happened in this space since `a`: no call needed.
+                with write_tx(conn):
+                    add_coverage(conn, name, a, done_until)
                 continue
             try:
-                msgs = list_messages(svc, sp["name"], iso_z(lo), iso_z(hi))
+                msgs = list_messages(svc, name, a, b)
             except HttpError as e:
-                no_access.append({"space": title_of(sp), "error": f"HTTP {e.resp.status}"})
-                continue
-            if not msgs:
-                continue
-            os.makedirs(mdir, exist_ok=True)
-            write_atomic(path, render(sp, msgs, lo, hi, now_iso, people, me_id, my_name))
-            drop_renamed(mdir, path)
-            files.append({"path": path, "space": title_of(sp),
-                          "month": m.strftime("%Y-%m"), "messages": len(msgs)})
-            total += len(msgs)
-            log(f"    {len(msgs):5d}  {title_of(sp)}")
+                no_access.append({"space": title, "error": f"HTTP {e.resp.status}"})
+                failed = True
+                break
+            fetched += 1
+            c, d, months, who = store_window(conn, name, msgs, a, b, done_until, now_iso)
+            changed, deleted = changed + c, deleted + d
+            touched[name] |= months
+            senders |= who
 
-    code = 2 if no_access else 0
+        if fetched:
+            stats["fetched"] += 1
+        elif not failed:
+            stats["skipped_inactive"] += 1
+        changed_total += changed
+        deleted_total += deleted
+        if changed or deleted:
+            extra = f"  ({deleted} deleted)" if deleted else ""
+            log(f"    {changed:+6d}  {title}{extra}")
 
+    # Senders who left a space are not among its members: resolve them too.
+    resolve_people(conn, lookup, senders, now_iso, log)
+
+    # A renamed space (e.g. a DM whose person just got resolved) gets all its
+    # files rewritten under the new name.
+    for name in renamed & {sp["name"] for sp in kept}:
+        touched[name] |= {r[0] for r in conn.execute(
+            "SELECT DISTINCT substr(create_time, 1, 7) FROM messages "
+            "WHERE space = ? AND deleted = 0", (name,))}
+
+    names = people_names(conn)
+    kinds = {sp["name"]: space_type(sp) for sp in spaces}
+    files = []
+    for name in sorted(touched):
+        for month in sorted(m for m in touched[name] if m):
+            path, count = write_markdown(conn, md_dir, name, titles[name], kinds[name],
+                                         month, names, now_iso)
+            files.append({"path": path, "space": titles[name], "month": month,
+                          "messages": count})
+
+    return {
+        "seq": {"before": seq_before, "after": max_seq(conn)},
+        "messages_changed": changed_total,
+        "messages_deleted": deleted_total,
+        "spaces": stats,
+        "files": files,
+        "no_access": no_access,
+    }
+
+
+# ---------------------------------------------------------------- cli
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Download Google Chat messages into SQLite plus readable Markdown.")
+    ap.add_argument("--days", type=int, help="last N days")
+    ap.add_argument("--since", help="YYYY-MM-DD (UTC)")
+    ap.add_argument("--until", help="YYYY-MM-DD (UTC, exclusive)")
+    ap.add_argument("--month", help="YYYY-MM: a whole month")
+    ap.add_argument("--only", action="append", default=[],
+                    help="only spaces whose name contains this (repeatable)")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="skip spaces whose name contains this (repeatable)")
+    ap.add_argument("--force", action="store_true",
+                    help="re-download the window even if already covered or inactive")
+    ap.add_argument("--update", action="store_true",
+                    help="incremental download; the default, kept for compatibility")
+    ap.add_argument("--list-spaces", action="store_true", help="list spaces and exit")
+    ap.add_argument("--reauth", action="store_true", help="delete the token and authorize again")
+    ap.add_argument("--non-interactive", action="store_true",
+                    help=f"never open a browser; exit {EXIT_AUTH} if authorization is needed")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable summary on stdout; logs go to stderr")
+    ap.add_argument("--data-dir",
+                    help=f"where the store and Markdown live "
+                         f"(default: $GCHAT_DATA_DIR or {DEFAULT_DATA_DIR})")
+    return ap.parse_args(argv)
+
+
+def resolve_window(args, today):
+    """(since, until) for an explicit range, or None for incremental mode."""
+    if args.month:
+        start = dt.date.fromisoformat(args.month + "-01")
+        return start, next_month(start)
+    if args.days:
+        return today - dt.timedelta(days=args.days), today + dt.timedelta(days=1)
+    if args.since or args.until:
+        since = dt.date.fromisoformat(args.since) if args.since else month_start(today)
+        until = dt.date.fromisoformat(args.until) if args.until else today + dt.timedelta(days=1)
+        return since, until
+    if args.force:
+        return month_start(today), today + dt.timedelta(days=1)
+    return None
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    # With --json, stdout is reserved for the JSON document.
+    log = (lambda *a: print(*a, file=sys.stderr)) if args.json else print
+    today = utc_today()
+
+    # Validate before touching the network or the browser.
+    try:
+        window = resolve_window(args, today)
+    except ValueError as e:
+        log(f"[X] Invalid date: {e}")
+        return EXIT_ERROR
+    if window and window[1] <= window[0]:
+        log(f"[X] Empty range: {window[0]} -> {window[1]}")
+        return EXIT_ERROR
+
+    data_dir = os.path.abspath(args.data_dir or os.environ.get("GCHAT_DATA_DIR")
+                               or DEFAULT_DATA_DIR)
+    db_path = os.path.join(data_dir, DB_NAME)
+    md_dir = os.path.join(data_dir, "md")
+
+    try:
+        creds = get_creds(reauth=args.reauth, interactive=not args.non_interactive, log=log)
+    except AuthRequired as e:
+        log(f"[X] {e}")
+        if args.json:
+            print(json.dumps({"error": "auth_required", "message": str(e)}))
+        return EXIT_AUTH
+
+    account = whoami(creds)
+    log(f"[i] Account: {account}")
+    chat = build("chat", "v1", credentials=creds, cache_discovery=False)
+    lookup = people_lookup(creds, log)
+    conn = open_db(db_path)
+    try:
+        if args.list_spaces:
+            now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            spaces, titles, _, _ = load_spaces(conn, chat, lookup, account, now_iso, log=log)
+            rows = sorted(({"name": sp["name"], "title": titles[sp["name"]],
+                            "type": space_type(sp), "last_active": sp.get("lastActiveTime"),
+                            "file": space_filename(sp["name"], titles[sp["name"]])}
+                           for sp in spaces), key=lambda r: r["title"].lower())
+            if args.json:
+                print(json.dumps({"account": account, "spaces": rows}, ensure_ascii=False, indent=2))
+            else:
+                log(f"[i] {len(rows)} spaces:\n")
+                for r in rows:
+                    log(f"    {r['title']:<45} {r['type']:<16} {(r['last_active'] or '')[:10]}")
+            return EXIT_OK
+
+        report = sync(conn, chat, lookup, account=account, window=window, md_dir=md_dir,
+                      force=args.force, only=args.only, exclude=args.exclude,
+                      today=today, log=log)
+    finally:
+        conn.close()
+
+    code = EXIT_PARTIAL if report["no_access"] else EXIT_OK
     if args.json:
         print(json.dumps({
             "account": account,
-            "since": since.isoformat(),
-            "until": until.isoformat(),
-            "out": args.out,
-            "messages": total,
-            "files": files,
-            "skipped_already_downloaded": skipped_done,
-            "no_access": no_access,
+            "data_dir": data_dir,
+            "db": db_path,
+            "md_dir": md_dir,
+            "mode": "incremental" if window is None else "window",
+            "window": None if window is None else
+                      {"since": window[0].isoformat(), "until": window[1].isoformat()},
+            **report,
         }, ensure_ascii=False, indent=2))
     else:
-        log(f"\n[OK] {total} mensajes en {len(files)} archivos -> {args.out}")
-        if skipped_done:
-            log(f"     {skipped_done} space/mes ya estaban bajados (--force para rebajar)")
-        if no_access:
-            log(f"[!] Sin acceso a {len(no_access)} spaces:")
-            for e in no_access:
+        s, seq = report["spaces"], report["seq"]
+        log(f"\n[OK] {report['messages_changed']} messages new or changed, "
+            f"{report['messages_deleted']} deleted (seq {seq['before']} -> {seq['after']})")
+        log(f"     spaces: {s['fetched']} fetched, {s['skipped_inactive']} inactive, "
+            f"{s['skipped_covered']} already covered")
+        log(f"     {len(report['files'])} Markdown files updated -> {md_dir}")
+        log(f"     store: {db_path}")
+        if report["no_access"]:
+            log(f"[!] No access to {len(report['no_access'])} spaces:")
+            for e in report["no_access"]:
                 log(f"      {e['error']}  {e['space']}")
-
     return code
 
 
