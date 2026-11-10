@@ -1,0 +1,4 @@
+- [Proyecto gchat-mcp](proyecto-gchat-mcp.md) — MCP de Google Chat sobre SQLite local; antes gchat-export; lo usa revisar-mails
+- [Cuentas Google de Dani](cuentas-google-de-dani.md) — dos cuentas; el Chrome por defecto es la personal, el laburo es blueboot
+- [Verificar cuenta antes de actuar en consolas web](verificar-cuenta-antes-de-actuar-en-consolas-web.md) — me freno dos veces por avanzar con la cuenta equivocada
+- [Login de Google no se automatiza](login-google-no-se-automatiza.md) — Playwright no puede con el selector de cuentas; ese paso lo hace Dani

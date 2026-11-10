@@ -14,3 +14,8 @@ personas.json
 
 __pycache__/
 .playwright-mcp/
+
+.venv/
+*.egg-info/
+.pytest_cache/
+.superpowers/
